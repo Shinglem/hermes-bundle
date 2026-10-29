@@ -17,17 +17,21 @@ UPSTREAM_TAG.win32-x64                 # 由 CI 维护，记录本平台已构�
 ## 一次性配置
 
 1. 仓库保持 **public**（Actions 对 public 仓库免费无限，Windows runner 也不计费）。
-2. Settings → Actions → General → Workflow permissions 选 **Read and write**
-   （最后一步要提交 `UPSTREAM_TAG.*`）。
+2. Settings → Actions → General → Workflow permissions 选 **Read and write**。
+   个人账号创建的仓库通常默认就是它；如果 workflow 在「检查 GITHUB_TOKEN 写权限」这步就红了，
+   说明需要来这里改。权限不足时 `gh release create` 会 403，发版无从谈起。
 3. 如果 `main` 有分支保护，放行 `github-actions[bot]` 的推送；否则最后一步失败 ——
    不影响发版，只是下一轮会重复构建一次。
 
 ## 触发
 
+三种方式都**不需要在网页上登录**：
+
 | 方式 | 说明 |
 |---|---|
 | `schedule` | 每 6 小时查一次上游 |
-| `workflow_dispatch` | 手动跑；勾 `force` 可强制重建当前版本 |
+| `push` 到 `main` | 改 `.github/` 下的文件即可（`.md` 与 `UPSTREAM_TAG.*` 已被忽略，不会触发） |
+| `workflow_dispatch` | 网页点 Run workflow，或带 token 打 API；勾 `force` 强制重建 |
 
 上游**每天**都会发 `v0.22.5+canary.YYYYMMDDThhmmssZ` 这类预发布。流程只看
 `/releases/latest` 302 指向的稳定版，canary 不会触发构建。

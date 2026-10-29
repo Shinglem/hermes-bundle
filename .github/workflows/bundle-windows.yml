@@ -3,6 +3,11 @@
 # 投放位置：发行仓库的 .github/workflows/bundle-windows.yml
 # 配套文件：UPSTREAM_TAG.win32-x64（由本 workflow 自动维护，首次可以不存在）
 #
+# 三种触发方式，都不需要在网页上登录：
+#   * schedule —— 每 6 小时
+#   * push 到 main（改动 .github/ 下的文件即可，文档和标记文件不触发）
+#   * workflow_dispatch —— 网页或 API 手动触发
+#
 # 多平台：macOS / Linux 各用一份独立 workflow（bundle-macos.yml / bundle-linux.yml），
 # 共用同一个 release tag，靠资产名里的平台后缀区分。跳过判据必须按平台看资产，
 # 不能只看「release 是否存在」，否则后加的平台永远不会构建。
@@ -16,8 +21,14 @@ name: bundle-windows
 on:
   schedule:
     # 每 6 小时查一次上游。注意：仓库 60 天无提交时 GitHub 会自动停用 schedule，
-    # 所以构建成功后会 commit UPSTREAM_TAG.win32-x64 保活。
+    # 所以构建成功后会 commit UPSTREAM_TAG.<platform> 保活。
     - cron: '17 */6 * * *'
+  push:
+    branches: [main]
+    # 只改文档或标记文件不触发，避免「自动提交标记 → 又触发一次」的循环
+    paths-ignore:
+      - 'UPSTREAM_TAG.*'
+      - '**.md'
   workflow_dispatch:
     inputs:
       force:
@@ -117,8 +128,21 @@ jobs:
           $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
           if (-not (Test-Path $sevenZip)) { throw "找不到 $sevenZip（windows-latest 镜像应预装 7zip）" }
           Write-Host "7z: $sevenZip"
-          Get-PSDrive C | Format-Table Name, @{ n = 'FreeGB'; e = { [math]::Round($_.Free / 1GB, 1) } }
+          Get-PSDrive C | Format-Table Name, @{ n = 'FreeGB'; e = [math]::Round($_.Free / 1GB, 1) } | Out-String | Write-Host
           New-Item -ItemType Directory -Force -Path $env:WORK_DIR, 'C:\pm-cache' | Out-Null
+
+      - name: 检查 GITHUB_TOKEN 写权限
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # GET /repos/{owner}/{repo} 的 permissions 字段是相对当前 token 的，
+          # 用 GITHUB_TOKEN 调用就能看出它到底有没有写权限，免得白跑 70 分钟才发现 403。
+          $perm = gh api "repos/$env:GITHUB_REPOSITORY" --jq '.permissions.push' 2>$null
+          Write-Host "GITHUB_TOKEN push 权限: $perm"
+          if ($perm -ne 'true') {
+            throw "GITHUB_TOKEN 没有写权限。请到 Settings → Actions → General → Workflow permissions 选择 Read and write permissions 后重跑。"
+          }
 
       - name: 安装基准 Hermes（stable 通道 = 上游最新 release）
         run: |
