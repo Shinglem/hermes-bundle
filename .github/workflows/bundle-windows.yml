@@ -220,10 +220,13 @@ jobs:
           Get-Content (Join-Path $p 'manifest.json')
 
       # pm bundle 不写 install-stamp.json，缺了它 --version 会显示 `vunknown`、
-      # updateMechanism 也失效（见 hermes-core/13-win-bundle-创建实录.md §4.5）。
+      # updateMechanism 也失效（见 README「构建原理与已知坑」）。
       # payload 里没有 scripts/（git archive 排掉了），所以用 install 那份 checkout 的脚本，
       # 配 payload 自己的 python 生成，输出直接落在 payload/hermes-agent/ 下。
-      - name: 补 install-stamp.json
+      #
+      # 同一趟还要补 web_dist：pm bundle 的 git archive 不含 npm 构建产物，
+      # 而客户端的后端就是 `dashboard`（浏览器与客户端共用同端口），必须有 Web UI 才起得来。
+      - name: 补 install-stamp.json 与 web_dist
         run: |
           $ErrorActionPreference = 'Stop'
           $ver = '${{ steps.ver.outputs.version }}'
@@ -231,6 +234,21 @@ jobs:
           $repo = Join-Path $payload 'hermes-agent'
           $app = Join-Path $env:HERMES_HOME_DIR 'hermes-agent'
 
+          # ---- web_dist：dashboard 命令要它才能提供 Web UI ----
+          $srcDist = Join-Path $app 'hermes_cli\web_dist'
+          $dstDist = Join-Path $repo 'hermes_cli\web_dist'
+          if (-not (Test-Path (Join-Path $srcDist 'index.html'))) {
+            throw "install checkout 里没有 web_dist：$srcDist（install.ps1 应该已经构建过）"
+          }
+          Remove-Item $dstDist -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $dstDist | Out-Null
+          Copy-Item (Join-Path $srcDist '*') $dstDist -Recurse -Force
+          if (-not (Test-Path (Join-Path $dstDist 'index.html'))) { throw 'web_dist 复制后仍缺 index.html' }
+          $distFiles = (Get-ChildItem $dstDist -Recurse -File).Count
+          $distMb = [math]::Round((Get-ChildItem $dstDist -Recurse -File | Measure-Object Length -Sum).Sum / 1MB, 1)
+          Write-Host "web_dist: $distFiles 个文件 / $distMb MB"
+
+          # ---- install-stamp.json ----
           $manifest = Get-Content (Join-Path $payload 'manifest.json') -Raw | ConvertFrom-Json
           $py = Join-Path $payload ($manifest.runtime.storePython -replace '/', '\')
           if (-not (Test-Path $py)) { throw "payload 里的 python 不存在：$py" }
@@ -310,6 +328,11 @@ jobs:
             '4. 解压出 `payload/`，用 `payload\bin\hermes.exe` 启动；`HERMES_HOME` 由使用者另外指定'
             ''
             "分卷清单：$volumeList"
+            ''
+            '## 内容'
+            ''
+            '- `dashboard` 一个进程同时提供 WS JSON-RPC、REST 与 Web UI（`web_dist` 已包含，浏览器可直接打开同一端口）'
+            '- `install-stamp.json` 已生成：`--version` 报真实版本，`payload: bundled` 走桌面端更新语义'
             ''
             '## 说明'
             ''
