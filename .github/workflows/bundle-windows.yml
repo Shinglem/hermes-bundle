@@ -60,7 +60,7 @@ jobs:
       tag: ${{ steps.check.outputs.tag }}
       build: ${{ steps.check.outputs.build }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - id: check
         shell: bash
@@ -117,7 +117,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # 最后一步要 git pull --rebase（避免与并发提交打架），需要有完整历史
           fetch-depth: 0
@@ -165,13 +165,32 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $exe = Join-Path $env:HERMES_HOME_DIR 'bin\hermes.exe'
           if (-not (Test-Path $exe)) { throw "安装后找不到 $exe" }
-          $raw = (& $exe --version 2>&1 | Out-String).Trim()
-          Write-Host $raw
-          if ($raw -match 'v?(\d+\.\d+\.\d+)') {
-            $ver = $Matches[1]
-          } else {
-            throw "无法从版本输出解析 (x.y.z): $raw"
+
+          function Get-HermesVersion {
+            $out = (& $exe --version 2>&1 | Out-String).Trim()
+            if ($out -match 'v?(\d+\.\d+\.\d+)') {
+              return @{ Ok = $true; Ver = $Matches[1]; Raw = $out }
+            }
+            return @{ Ok = $false; Ver = $null; Raw = $out }
           }
+
+          $r = Get-HermesVersion
+          if (-not $r.Ok) {
+            # install.ps1 用 bootstrap python 跑 pm install，它建了 environments/<hash>/ 却不会
+            # commit selection（pm/environments.py: 非 selected 解释器的 lazy sync 不写 selection）。
+            # launcher 跑在 store python 上，于是 _require_own_dependencies 拒绝启动。
+            # 官方指定的唯一解就是这个，见 NoCommittedEnvironment 的 docstring：「no retry fixes
+            # it, only `hermes pm repair`」。repair 之后再起的进程就会切到 committed generation。
+            Write-Warning "首次 --version 失败：$($r.Raw)"
+            Write-Host '--- hermes pm repair ---'
+            & $exe pm repair 2>&1 | Write-Host
+            Write-Host "pm repair exit=$LASTEXITCODE"
+            $r = Get-HermesVersion
+          }
+          if (-not $r.Ok) { throw "无法取得版本号：$($r.Raw)" }
+
+          Write-Host $r.Raw
+          $ver = $r.Ver
           Write-Host "基准版本: $ver"
           "version=$ver" >> $env:GITHUB_OUTPUT
 
