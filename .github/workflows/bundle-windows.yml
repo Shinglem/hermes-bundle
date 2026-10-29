@@ -131,23 +131,20 @@ jobs:
           Get-PSDrive C | Format-Table Name, @{ n = 'FreeGB'; e = { [math]::Round($_.Free / 1GB, 1) } } | Out-String | Write-Host
           New-Item -ItemType Directory -Force -Path $env:WORK_DIR, 'C:\pm-cache' | Out-Null
 
-      - name: 探测 GITHUB_TOKEN 写权限（仅提示）
+      - name: 探测 token 权限（仅提示）
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 注意：这里**不能**用 GET /repos/{owner}/{repo} 的 permissions.push 做硬判断。
-          # 那个字段是相对认证实体的：PAT 调用时准确，但 GITHUB_TOKEN 是 GitHub App 的
-          # installation token，该字段恒为 false，与仓库的 Workflow permissions 设置无关
-          # （实测：仓库设成 write 之后仍然返回 false）。
-          # 所以只提示不拦截；真的没权限会在「发布 Release」那一步 403。
+          # 只做提示，绝不能把 step 带红：
+          #  * GET /repos/{owner}/{repo} 的 permissions.push 是相对认证实体的，
+          #    GITHUB_TOKEN 作为 installation token 时恒为 false，与仓库设置无关
+          #    （实测：仓库改成 write 后该字段仍是 false）。
+          #  * /actions/permissions/workflow 需要 admin，GITHUB_TOKEN 读会 403。
+          # 真没写权限的后果会在「发布 Release」那一步以 403 暴露。
           $push = gh api "repos/$env:GITHUB_REPOSITORY" --jq '.permissions.push' 2>$null
-          $wf = gh api "repos/$env:GITHUB_REPOSITORY/actions/permissions/workflow" --jq '.default_workflow_permissions' 2>$null
-          Write-Host "permissions.push=$push（installation token 下不可靠）"
-          if ($wf) { Write-Host "仓库 Workflow permissions 默认值: $wf" }
-          if ($wf -eq 'read') {
-            Write-Warning "仓库 Workflow permissions 是 read-only，发布 Release 会 403。" +
-              "请到 Settings → Actions → General → Workflow permissions 选 Read and write。"
-          }
+          Write-Host "permissions.push=$push（installation token 下不可靠，仅作参考）"
+          # GitHub 的 pwsh 步骤结尾会 exit $LASTEXITCODE，这里必须显式归零
+          exit 0
 
       - name: 安装基准 Hermes（stable 通道 = 上游最新 release）
         run: |
