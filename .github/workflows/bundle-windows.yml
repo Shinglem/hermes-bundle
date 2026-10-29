@@ -128,7 +128,7 @@ jobs:
           $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
           if (-not (Test-Path $sevenZip)) { throw "找不到 $sevenZip（windows-latest 镜像应预装 7zip）" }
           Write-Host "7z: $sevenZip"
-          Get-PSDrive C | Format-Table Name, @{ n = 'FreeGB'; e = [math]::Round($_.Free / 1GB, 1) } | Out-String | Write-Host
+          Get-PSDrive C | Format-Table Name, @{ n = 'FreeGB'; e = { [math]::Round($_.Free / 1GB, 1) } } | Out-String | Write-Host
           New-Item -ItemType Directory -Force -Path $env:WORK_DIR, 'C:\pm-cache' | Out-Null
 
       - name: 检查 GITHUB_TOKEN 写权限
