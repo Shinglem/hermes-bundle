@@ -1,0 +1,284 @@
+# 上游 Hermes Agent 发稳定版 → 云端构建 win32-x64 便携 payload → 分卷发布到本仓库 Releases。
+#
+# 投放位置：发行仓库的 .github/workflows/bundle-windows.yml
+# 配套文件：UPSTREAM_TAG.win32-x64（由本 workflow 自动维护，首次可以不存在）
+#
+# 多平台：macOS / Linux 各用一份独立 workflow（bundle-macos.yml / bundle-linux.yml），
+# 共用同一个 release tag，靠资产名里的平台后缀区分。跳过判据必须按平台看资产，
+# 不能只看「release 是否存在」，否则后加的平台永远不会构建。
+#
+# 设计前提（见 hermes-core/README.md 与 13-win-bundle-创建实录.md）：
+#   * pm bundle 的输入是一份「已安装」的 Hermes，所以先跑官方 install.ps1 装基准，再出 payload。
+#   * install.ps1 只有 -Channel stable|main，没有 -Tag；stable 永远指向上游最新 release。
+#   * GitHub Release 单文件硬上限 2 GiB，所以 7zip 分卷，每卷 1900 MiB。
+name: bundle-windows
+
+on:
+  schedule:
+    # 每 6 小时查一次上游。注意：仓库 60 天无提交时 GitHub 会自动停用 schedule，
+    # 所以构建成功后会 commit UPSTREAM_TAG.win32-x64 保活。
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 即使上游 tag 未变化也重新构建
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bundle-windows
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: NousResearch/hermes-agent
+  INSTALL_PS1: https://hermes-agent.nousresearch.com/install.ps1
+  PLATFORM: win32-x64
+  # 2 GiB = 2048 MiB 是 GitHub 的硬限制，1900 MiB 留 148 MiB 余量。
+  VOLUME_SIZE: 1900m
+  # 全部放 C:（约 80 GB 空闲）；windows-latest 的 D: 只有 ~14 GB，装不下 2.25 GB 安装 + 6 GB payload + 2.5 GB 分卷。
+  HERMES_HOME_DIR: C:\hermes-home
+  WORK_DIR: C:\bundle-work
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # 上游每天都会发 v0.22.5+canary.YYYYMMDDThhmmssZ 这种预发布，只跟稳定版。
+          # /releases/latest 会 302 到最新「稳定」release 的 tag 页，天然跳过预发布；
+          # 用 REST /releases/latest 也能判断，但匿名配额只有 60 次/小时/IP，
+          # 而 GITHUB_TOKEN 是仓库级 token，读不了 NousResearch/hermes-agent。
+          location=$(curl -fsS --retry 3 -o /dev/null -w '%{redirect_url}' \
+                     "https://github.com/${UPSTREAM_REPO}/releases/latest")
+          tag=${location##*/}
+          if [[ -z "${tag}" || "${tag}" == *"%2B"* ]]; then
+            echo "::error::无法解析上游稳定 tag（got: '${tag}'）"
+            exit 1
+          fi
+          echo "上游稳定 tag: ${tag}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          have="$(cat "UPSTREAM_TAG.${PLATFORM}" 2>/dev/null | tr -d '[:space:]' || true)"
+          echo "本平台已发布: ${have:-<none>}"
+
+          skip=false
+          if [[ "${{ inputs.force }}" != "true" ]]; then
+            if [[ "${tag}" == "${have}" ]]; then
+              skip=true
+              echo "::notice::UPSTREAM_TAG.${PLATFORM} 已经是 ${tag}"
+            fi
+            # 双保险：UPSTREAM_TAG 可能因 push 被拒绝而没写成功。
+            # 必须按平台看资产 —— 只看「release 是否存在」会让后加的平台永远不构建。
+            assets=$(gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" --json assets \
+                     -q '.assets[].name' 2>/dev/null || true)
+            if grep -q -- "-${PLATFORM}\.7z\.001$" <<< "${assets}"; then
+              skip=true
+              echo "::notice::${tag} 已有 ${PLATFORM} 资产"
+            fi
+          fi
+
+          if [[ "${skip}" == "true" ]]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 最后一步要 git pull --rebase（避免与并发提交打架），需要有完整历史
+          fetch-depth: 0
+
+      - name: 预检
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path $sevenZip)) { throw "找不到 $sevenZip（windows-latest 镜像应预装 7zip）" }
+          Write-Host "7z: $sevenZip"
+          Get-PSDrive C | Format-Table Name, @{ n = 'FreeGB'; e = { [math]::Round($_.Free / 1GB, 1) } }
+          New-Item -ItemType Directory -Force -Path $env:WORK_DIR, 'C:\pm-cache' | Out-Null
+
+      - name: 安装基准 Hermes（stable 通道 = 上游最新 release）
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri $env:INSTALL_PS1 -OutFile 'C:\install.ps1' -UseBasicParsing
+          pwsh -NoProfile -ExecutionPolicy Bypass -File 'C:\install.ps1' `
+            -NonInteractive -Channel stable `
+            -HermesHome $env:HERMES_HOME_DIR `
+            -InstallDir "$env:HERMES_HOME_DIR\hermes-agent" `
+            -SkipBrowser -SkipComputerUse
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 失败，exit=$LASTEXITCODE" }
+
+      - name: 读取基准版本
+        id: ver
+        env:
+          EXPECTED_TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:HERMES_HOME_DIR 'bin\hermes.exe'
+          if (-not (Test-Path $exe)) { throw "安装后找不到 $exe" }
+          $raw = (& $exe --version 2>&1 | Out-String).Trim()
+          Write-Host $raw
+          if ($raw -match 'v?(\d+\.\d+\.\d+)') {
+            $ver = $Matches[1]
+          } else {
+            throw "无法从版本输出解析 (x.y.z): $raw"
+          }
+          Write-Host "基准版本: $ver"
+          "version=$ver" >> $env:GITHUB_OUTPUT
+
+          # stable 通道偶尔比 releases.atom 慢半拍；以实际装出来的版本为准。
+          if ("v$ver" -ne $env:EXPECTED_TAG) {
+            Write-Warning "基准版本 v$ver 与上游最新 tag $env:EXPECTED_TAG 不一致"
+          }
+
+      - name: 构建 payload
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:UV_CACHE_DIR = Join-Path $env:HERMES_HOME_DIR 'uv-cache'
+          $out = Join-Path $env:WORK_DIR 'payload'
+          & (Join-Path $env:HERMES_HOME_DIR 'bin\hermes.exe') pm bundle --out $out --cache 'C:\pm-cache'
+          if ($LASTEXITCODE -ne 0) { throw "pm bundle 失败，exit=$LASTEXITCODE" }
+
+      - name: 校验 payload
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $p = Join-Path $env:WORK_DIR 'payload'
+          # 全量包必须六项齐全，缺任何一项都说明 pm bundle 没跑完
+          foreach ($item in 'bin', 'hermes-agent', 'tools', 'venv', 'pm-runtime', 'uv-cache', 'manifest.json') {
+            if (-not (Test-Path (Join-Path $p $item))) { throw "payload 缺少 $item" }
+          }
+          $mb = [math]::Round((Get-ChildItem $p -Recurse -File -Force | Measure-Object Length -Sum).Sum / 1MB)
+          Write-Host "payload 体积: $mb MB"
+          Get-Content (Join-Path $p 'manifest.json')
+
+      - name: 分卷压缩
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = '${{ steps.ver.outputs.version }}'
+          $archive = "hermes-payload-v$ver-$env:PLATFORM.7z"
+          Push-Location $env:WORK_DIR
+          try {
+            & 'C:\Program Files\7-Zip\7z.exe' a -t7z -mx=5 -mmt=on "-v$env:VOLUME_SIZE" $archive 'payload'
+            # 7z 的退出码：0 成功，1 有警告（非致命）
+            if ($LASTEXITCODE -gt 1) { throw "7z 失败，exit=$LASTEXITCODE" }
+          } finally { Pop-Location }
+
+          $volumes = Get-ChildItem (Join-Path $env:WORK_DIR "$archive.*") | Sort-Object Name
+          if ($volumes.Count -eq 0) { throw '没有产出任何分卷' }
+          foreach ($v in $volumes) {
+            if ($v.Length -ge 2GB) { throw "$($v.Name) = $($v.Length) 字节，超过 GitHub 的 2 GiB 单文件上限" }
+            Write-Host ('{0}  {1:N0} MB' -f $v.Name, ($v.Length / 1MB))
+          }
+          Write-Host "共 $($volumes.Count) 卷"
+
+      - name: 生成校验文件与发布说明
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = '${{ steps.ver.outputs.version }}'
+          $archive = "hermes-payload-v$ver-$env:PLATFORM.7z"
+
+          $volumes = Get-ChildItem (Join-Path $env:WORK_DIR "$archive.*") | Sort-Object Name
+          $lines = foreach ($v in $volumes) {
+            '{0}  {1}' -f (Get-FileHash $v.FullName -Algorithm SHA256).Hash.ToLower(), $v.Name
+          }
+          Set-Content (Join-Path $env:WORK_DIR 'SHA256SUMS.txt') $lines -Encoding ascii
+          Get-Content (Join-Path $env:WORK_DIR 'SHA256SUMS.txt') | ForEach-Object { Write-Host $_ }
+
+          $volumeList = ($volumes.Name) -join '、'
+          $notes = @(
+            "Hermes Agent **v$ver** 的 $env:PLATFORM 便携 payload（上游 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)）。"
+            ''
+            "上游 release: https://github.com/NousResearch/hermes-agent/releases/tag/v$ver"
+            ''
+            '## 下载后怎么用'
+            ''
+            '1. 下载**全部**分卷（`.7z.001`、`.7z.002` …）以及 `SHA256SUMS.txt`'
+            '2. 校验：`Get-FileHash *.7z.001` 与 `SHA256SUMS.txt` 比对'
+            "3. 解压：``7z x ${archive}.001`` —— 7-Zip 会自动串联所有分卷，不需要先合并"
+            '4. 解压出 `payload/`，用 `payload\bin\hermes.exe` 启动；`HERMES_HOME` 由使用者另外指定'
+            ''
+            "分卷清单：$volumeList"
+            ''
+            '## 说明'
+            ''
+            '- payload 是只读快照，更新方式为换整包。'
+            '- 内含 git(GPLv2)、ffmpeg(GPL/LGPL)、chromium(BSD) 等第三方二进制，许可随各自发行说明；Hermes 本体为 MIT。'
+            '- 包含 `uv-cache/`（约 1.1 GB），用于插件依赖离线重建；它是压缩率最差的一块，属功能完整性所需。'
+          )
+          Set-Content (Join-Path $env:WORK_DIR 'RELEASE_NOTES.md') $notes -Encoding utf8NoBOM
+          Write-Host "发布说明已写入 RELEASE_NOTES.md（$($notes.Count) 行）"
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = '${{ steps.ver.outputs.version }}'
+          $tag = "v$ver"
+          $repo = $env:GITHUB_REPOSITORY
+
+          gh release view $tag --repo $repo 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Warning "$tag 已存在，改为覆盖上传资产"
+          } else {
+            gh release create $tag --repo $repo `
+              --title "Hermes payload v$ver ($env:PLATFORM)" `
+              --notes-file (Join-Path $env:WORK_DIR 'RELEASE_NOTES.md')
+            if ($LASTEXITCODE -ne 0) { throw "gh release create 失败，exit=$LASTEXITCODE" }
+          }
+
+          $files = @(Get-ChildItem (Join-Path $env:WORK_DIR '*.7z.*') | Sort-Object Name | Select-Object -ExpandProperty FullName)
+          $files += Join-Path $env:WORK_DIR 'SHA256SUMS.txt'
+          Write-Host "上传 $($files.Count) 个文件"
+          gh release upload $tag @files --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload 失败，exit=$LASTEXITCODE" }
+
+      - name: 记录上游 tag（保活 schedule）
+        env:
+          EXPECTED_TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = '${{ steps.ver.outputs.version }}'
+          $marker = "UPSTREAM_TAG.$env:PLATFORM"
+
+          # 基准版本与上游 tag 对不上说明 stable 通道还没追平，不写标记，下一轮重试。
+          if ("v$ver" -ne $env:EXPECTED_TAG) {
+            Write-Warning "跳过 $marker 更新（期望 $env:EXPECTED_TAG，实际 v$ver），下一轮会重试"
+            exit 0
+          }
+
+          Set-Content $marker $env:EXPECTED_TAG -NoNewline -Encoding ascii
+          git add $marker
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "$marker 无变化"
+            exit 0
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "chore: 发布上游 $env:EXPECTED_TAG 的 $env:PLATFORM payload"
+          git pull --rebase --autostash
+          git push
