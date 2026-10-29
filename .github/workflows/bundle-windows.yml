@@ -219,6 +219,50 @@ jobs:
           Write-Host "payload 体积: $mb MB"
           Get-Content (Join-Path $p 'manifest.json')
 
+      # pm bundle 不写 install-stamp.json，缺了它 --version 会显示 `vunknown`、
+      # updateMechanism 也失效（见 hermes-core/13-win-bundle-创建实录.md §4.5）。
+      # payload 里没有 scripts/（git archive 排掉了），所以用 install 那份 checkout 的脚本，
+      # 配 payload 自己的 python 生成，输出直接落在 payload/hermes-agent/ 下。
+      - name: 补 install-stamp.json
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = '${{ steps.ver.outputs.version }}'
+          $payload = Join-Path $env:WORK_DIR 'payload'
+          $repo = Join-Path $payload 'hermes-agent'
+          $app = Join-Path $env:HERMES_HOME_DIR 'hermes-agent'
+
+          $manifest = Get-Content (Join-Path $payload 'manifest.json') -Raw | ConvertFrom-Json
+          $py = Join-Path $payload ($manifest.runtime.storePython -replace '/', '\')
+          if (-not (Test-Path $py)) { throw "payload 里的 python 不存在：$py" }
+          if (-not (Test-Path (Join-Path $app 'scripts\write_install_stamp.py'))) {
+            throw "install checkout 里没有 scripts/write_install_stamp.py：$app"
+          }
+
+          $commit = (& git -C $app rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $commit) { throw "拿不到 install checkout 的 HEAD" }
+          Write-Host "commit=$commit  base-version=$ver"
+
+          $env:HERMES_DESKTOP_VARIANT = 'bundled'
+          $env:HERMES_PAYLOAD_TAG = "v$ver"
+          Push-Location $app
+          try {
+            & $py 'scripts\write_install_stamp.py' `
+              --output (Join-Path $repo 'install-stamp.json') `
+              --commit $commit --base-version $ver --distance 0 `
+              --source bundle --distribution desktop-app --update-mechanism external `
+              --runtime-dir ../tools
+            if ($LASTEXITCODE -ne 0) { throw "write_install_stamp.py 失败，exit=$LASTEXITCODE" }
+          } finally { Pop-Location }
+
+          Write-Host '--- install-stamp.json ---'
+          Get-Content (Join-Path $repo 'install-stamp.json')
+
+          # 关键验收：payload 自己的 launcher 必须报出正确版本，不能再是 vunknown
+          $payloadExe = Join-Path $payload 'bin\hermes.exe'
+          $out = (& $payloadExe --version 2>&1 | Out-String)
+          Write-Host $out
+          if ($out -notmatch "v$ver") { throw "payload --version 没有报出 v$ver：$out" }
+
       - name: 分卷压缩
         run: |
           $ErrorActionPreference = 'Stop'
