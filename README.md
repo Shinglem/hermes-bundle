@@ -18,8 +18,9 @@ UPSTREAM_TAG.win32-x64                 # 由 CI 维护，记录本平台已构�
 
 1. 仓库保持 **public**（Actions 对 public 仓库免费无限，Windows runner 也不计费）。
 2. Settings → Actions → General → Workflow permissions 选 **Read and write**。
-   个人账号创建的仓库通常默认就是它；如果 workflow 在「检查 GITHUB_TOKEN 写权限」这步就红了，
-   说明需要来这里改。权限不足时 `gh release create` 会 403，发版无从谈起。
+   GitHub 对新仓库的默认值是 **read-only**，此时 `gh release create` 会 403，发版无从谈起。
+   workflow 里的探测步骤只打印警告、不拦截 —— `GITHUB_TOKEN` 是 installation token，
+   `GET /repos` 返回的 `permissions.push` 对它恒为 false，不能拿来当判据。
 3. 如果 `main` 有分支保护，放行 `github-actions[bot]` 的推送；否则最后一步失败 ——
    不影响发版，只是下一轮会重复构建一次。
 
