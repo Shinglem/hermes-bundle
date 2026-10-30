@@ -35,6 +35,10 @@ on:
         description: 即使上游 tag 未变化也重新构建
         type: boolean
         default: false
+      include_official_desktop:
+        description: 附带官方 Electron 桌面端（debug-only，v1.0.0 移除）
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -52,6 +56,10 @@ env:
   # 全部放 C:（约 80 GB 空闲）；windows-latest 的 D: 只有 ~14 GB，装不下 2.25 GB 安装 + 6 GB payload + 2.5 GB 分卷。
   HERMES_HOME_DIR: C:\hermes-home
   WORK_DIR: C:\bundle-work
+  # 官方 Electron 桌面端（debug-only，v1.0.0 移除）：只用来「同一个后端、两套 UI」对照调试。
+  # dispatch 时可用 input 关掉；构建失败一律 fail-open（只警告，payload 照常发）。
+  # 表达式：dispatch 显式传值时听它的，其余情况（schedule / push）默认附上。
+  INCLUDE_OFFICIAL_DESKTOP: ${{ github.event_name == 'workflow_dispatch' && (inputs.include_official_desktop && 'true' || 'false') || 'true' }}
 
 jobs:
   detect:
@@ -147,14 +155,20 @@ jobs:
           exit 0
 
       - name: 安装基准 Hermes（stable 通道 = 上游最新 release）
+        # -IncludeDesktop 时这一步会多跑桌面端构建（npm ci + electron-builder --dir），
+        # 是整个 workflow 最慢的一段（十几分钟）。它**不能** fail-open：install.ps1 失败
+        # 意味着基准都没装好。桌面端构建失败由下一步单独兜（那里只复制产物）。
         run: |
           $ErrorActionPreference = 'Stop'
           Invoke-WebRequest -Uri $env:INSTALL_PS1 -OutFile 'C:\install.ps1' -UseBasicParsing
-          pwsh -NoProfile -ExecutionPolicy Bypass -File 'C:\install.ps1' `
-            -NonInteractive -Channel stable `
-            -HermesHome $env:HERMES_HOME_DIR `
-            -InstallDir "$env:HERMES_HOME_DIR\hermes-agent" `
-            -SkipBrowser -SkipComputerUse
+          $installArgs = @(
+            '-NonInteractive', '-Channel', 'stable',
+            '-HermesHome', $env:HERMES_HOME_DIR,
+            '-InstallDir', "$env:HERMES_HOME_DIR\hermes-agent",
+            '-SkipBrowser', '-SkipComputerUse'
+          )
+          if ($env:INCLUDE_OFFICIAL_DESKTOP -eq 'true') { $installArgs += '-IncludeDesktop' }
+          pwsh -NoProfile -ExecutionPolicy Bypass -File 'C:\install.ps1' @installArgs
           if ($LASTEXITCODE -ne 0) { throw "install.ps1 失败，exit=$LASTEXITCODE" }
 
       - name: 读取基准版本
@@ -281,6 +295,55 @@ jobs:
           Write-Host $out
           if ($out -notmatch "v$ver") { throw "payload --version 没有报出 v$ver：$out" }
 
+      # 官方 Electron 桌面端（debug-only，v1.0.0 移除，见 hermes-compose ADR-045）
+      #
+      # 为什么要它：同一个后端、两套 UI 并排对照（官方 Electron 客户端 vs 我们的 Compose 客户端），
+      # 用来确认「是我们的实现不对，还是后端就这样」。
+      #
+      # 形态：install.ps1 -IncludeDesktop 已经跑过 `npm ci` + `electron-builder --dir`，
+      # 产物在 apps/desktop/release/win-unpacked（未打包目录：免安装、免签名、可直接跑）。
+      # 不用 MSIX：Windows 官方分发需要签名证书 + Win11 工具链。
+      #
+      # 落位：payload/official-desktop/（不进 bin/，免得和 payload 自己的 launcher 混淆）。
+      # 客户端只在检测到 official-desktop/Hermes.exe 时才显示「调试」入口。
+      #
+      # fail-open：对照包是调试附件，任何失败只警告，主产物照发 —— 但也正因为最后都能过，
+      # 失败必须显式打出来，否则会静默少个目录。
+      - name: 附带官方桌面端（debug-only）
+        if: env.INCLUDE_OFFICIAL_DESKTOP == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            $app = Join-Path $env:HERMES_HOME_DIR 'hermes-agent'
+            $release = Join-Path $app 'apps\desktop\release'
+            $candidates = @('win-unpacked', 'win-arm64-unpacked', 'win-ia32-unpacked')
+            $source = $null
+            foreach ($c in $candidates) {
+              $p = Join-Path $release $c
+              if (Test-Path $p) { $source = $p; break }
+            }
+            if (-not $source) {
+              throw "没有找到 win-unpacked（$release）：install.ps1 -IncludeDesktop 可能没跑或构建失败"
+            }
+            $exe = Join-Path $source 'Hermes.exe'
+            if (-not (Test-Path $exe)) { throw "产物里没有 Hermes.exe：$source" }
+
+            $dest = Join-Path $env:WORK_DIR 'payload\official-desktop'
+            Remove-Item $dest -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force $dest | Out-Null
+            Copy-Item (Join-Path $source '*') $dest -Recurse -Force
+
+            $files = (Get-ChildItem $dest -Recurse -File -Force).Count
+            $mb = [math]::Round((Get-ChildItem $dest -Recurse -File -Force | Measure-Object Length -Sum).Sum / 1MB, 1)
+            Write-Host "official-desktop: $files 个文件 / $mb MB"
+            if (-not (Test-Path (Join-Path $dest 'Hermes.exe'))) { throw '复制后仍缺 Hermes.exe' }
+            "OFFICIAL_DESKTOP_MB=$mb" >> $env:GITHUB_ENV
+          } catch {
+            Write-Warning "官方桌面端未附带（不影响主产物）：$($_.Exception.Message)"
+            "OFFICIAL_DESKTOP_MB=0" >> $env:GITHUB_ENV
+          }
+
       - name: 分卷压缩
         run: |
           $ErrorActionPreference = 'Stop'
@@ -333,6 +396,12 @@ jobs:
             ''
             '- `dashboard` 一个进程同时提供 WS JSON-RPC、REST 与 Web UI（`web_dist` 已包含，浏览器可直接打开同一端口）'
             '- `install-stamp.json` 已生成：`--version` 报真实版本，`payload: bundled` 走桌面端更新语义'
+            ''
+            '## 官方桌面端对照包（debug-only，v1.0.0 移除）'
+            ''
+            "`payload\official-desktop\Hermes.exe` 是**官方 Electron 桌面端**的未打包目录（$env:OFFICIAL_DESKTOP_MB MB），"
+            '用途是「同一个后端、两套 UI」并排对照调试：先用 `payload\bin\hermes.exe dashboard` 起后端，'
+            '再分别用官方客户端和自研客户端连它。它**不是**产品的一部分，v1.0.0 起会移除。'
             ''
             '## 说明'
             ''

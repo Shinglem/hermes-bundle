@@ -32,7 +32,7 @@ UPSTREAM_TAG.win32-x64                 # 由 CI 维护，记录本平台已构�
 |---|---|
 | `schedule` | 每 6 小时查一次上游 |
 | `push` 到 `main` | 改 `.github/` 下的文件即可（`.md` 与 `UPSTREAM_TAG.*` 已被忽略，不会触发） |
-| `workflow_dispatch` | 网页点 Run workflow，或带 token 打 API；勾 `force` 强制重建 |
+| `workflow_dispatch` | 网页点 Run workflow，或带 token 打 API；勾 `force` 强制重建；`include_official_desktop` 控制是否附带官方桌面端（默认勾） |
 
 上游**每天**都会发 `v0.22.5+canary.YYYYMMDDThhmmssZ` 这类预发布。流程只看
 `/releases/latest` 302 指向的稳定版，canary 不会触发构建。
@@ -57,6 +57,21 @@ UPSTREAM_TAG.win32-x64                 # 由 CI 维护，记录本平台已构�
 
 `install.ps1` 只有 `-Channel stable|main`、没有 `-Tag`，版本由上游 stable 通道决定；
 构建后用 `hermes --version` 复核，不一致就只发版不写 `UPSTREAM_TAG.*`，下一轮自动重试。
+
+### 官方桌面端对照包（debug-only，v1.0.0 移除）
+
+`payload/official-desktop/` 里附一份**官方 Electron 桌面端**（`npm ci` + `electron-builder --dir`
+的未打包目录），用途是「同一个后端、两套 UI」并排对照调试。来源是 install checkout 的
+`apps/desktop/release/win-unpacked`，由 `install.ps1 -IncludeDesktop` 顺带构建出来 ——
+这一步让 `copies` 阶段多出几十万个小文件，是整个 workflow 最慢的一段（十几分钟量级）。
+
+- 开关：workflow 级 `INCLUDE_OFFICIAL_DESKTOP`（默认 true；dispatch 的 `include_official_desktop` 可关）
+- 失败 **fail-open**：只 `Write-Warning`，payload 照常发，只是少这个目录
+- 不进 `bin/`，避免和 payload 自己的 launcher 混淆；客户端只在检测到
+  `official-desktop/Hermes.exe` 时才显示「调试」入口
+- 体积：未压缩约 390 MB，7z 后预计 +130~150 MB（仍在 1900 MiB 单卷内）
+- 移除清单（v1.0.0）：workflow 的 `-IncludeDesktop` 分支与本步骤、发布说明那一段、
+  hermes-compose 的「调试」分组与 `app.debug.officialDesktop` 字段
 
 ## 产物（v0.22.5 实测）
 
