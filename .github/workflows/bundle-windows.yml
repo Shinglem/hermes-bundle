@@ -423,7 +423,12 @@ jobs:
 
           gh release view $tag --repo $repo 2>$null
           if ($LASTEXITCODE -eq 0) {
-            Write-Warning "$tag 已存在，改为覆盖上传资产"
+            # 已存在的 Release 不会因 upload 而更新说明，必须显式 edit，否则对照包等新段落永远不出现
+            Write-Warning "$tag 已存在，改为覆盖资产并刷新说明"
+            gh release edit $tag --repo $repo `
+              --title "Hermes payload v$ver ($env:PLATFORM)" `
+              --notes-file (Join-Path $env:WORK_DIR 'RELEASE_NOTES.md')
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit 失败，exit=$LASTEXITCODE" }
           } else {
             gh release create $tag --repo $repo `
               --title "Hermes payload v$ver ($env:PLATFORM)" `
