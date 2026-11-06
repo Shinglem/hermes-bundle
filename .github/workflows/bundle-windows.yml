@@ -68,7 +68,7 @@ jobs:
       tag: ${{ steps.check.outputs.tag }}
       build: ${{ steps.check.outputs.build }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - id: check
         shell: bash
@@ -125,7 +125,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # 最后一步要 git pull --rebase（避免与并发提交打架），需要有完整历史
           fetch-depth: 0
